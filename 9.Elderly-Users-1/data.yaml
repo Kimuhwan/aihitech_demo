@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 2
+names: ['6-Mobility Impaired - v2 2025-01-20 10-23pm', 'Elderly Users']
+
+roboflow:
+  workspace: llllo
+  project: 9.elderly-users-qryyj
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/llllo/9.elderly-users-qryyj/dataset/1
