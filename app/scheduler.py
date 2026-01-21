@@ -2,224 +2,200 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
-from typing import Optional
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta
+from typing import Optional, List
 
-from zoneinfo import ZoneInfo
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
-from app.db import SessionLocal
-from app.models import ScheduleItem, ScheduleLog
+from .db import SessionLocal
+from .models import ScheduleItem, ScheduleLog
+from .tts_queue import enqueue_tts
 
-KST = ZoneInfo("Asia/Seoul")
+POLL_INTERVAL_SECONDS = 1
+DUE_WINDOW_SECONDS = 60  # 1초는 놓치기 쉬움. 로그 중복방지 있으니 60초 권장.
+
+_scheduler_task: Optional[asyncio.Task] = None
 
 
-# -------------------------
-# Time helpers (KST naive)
-# -------------------------
-def now_kst_naive() -> datetime:
+@dataclass(frozen=True)
+class DueDecision:
+    is_due: bool
+    scheduled_for: Optional[datetime] = None
+
+
+def _now_local() -> datetime:
+    return datetime.now()
+
+
+def _parse_time_of_day(value) -> Optional[time]:
     """
-    SQLite MVP에서 가장 덜 헷갈리는 방식:
-    - "KST 시간"을 DB에 그대로 저장
-    - tzinfo는 제거(naive datetime)
+    DB에는 "HH:MM" 문자열로 저장한다고 가정.
     """
-    return datetime.now(KST).replace(tzinfo=None)
+    if value is None:
+        return None
+    if isinstance(value, time):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(s, fmt).time()
+            except ValueError:
+                pass
+    return None
 
 
-def truncate_to_minute(dt: datetime) -> datetime:
-    # naive datetime 가정
-    return dt.replace(second=0, microsecond=0)
+def _is_enabled(item: ScheduleItem) -> bool:
+    # enabled 우선. (과거 필드 is_active도 호환 가능)
+    if hasattr(item, "enabled"):
+        return bool(getattr(item, "enabled"))
+    if hasattr(item, "is_active"):
+        return bool(getattr(item, "is_active"))
+    return True
 
 
-# -------------------------
-# Lock / logging helpers
-# -------------------------
-def acquire_minute_lock(db: Session, item_id: int, scheduled_for: datetime) -> bool:
-    """
-    분 단위 중복 실행 방지:
-    (schedule_item_id, scheduled_for) 조합으로 ScheduleLog에 STARTED를 먼저 남겨 선점.
+def _compute_scheduled_for(item: ScheduleItem, now: datetime) -> Optional[datetime]:
+    if not _is_enabled(item):
+        return None
 
-    권장(가능하면): DB에 unique constraint 추가
-      Unique(schedule_item_id, scheduled_for)
-    """
+    tod = _parse_time_of_day(getattr(item, "time_of_day", None))
+    if tod is None:
+        return None
+
+    return datetime.combine(now.date(), tod)
+
+
+def _is_due_now(item: ScheduleItem, now: datetime, window_seconds: int) -> DueDecision:
+    scheduled_for = _compute_scheduled_for(item, now)
+    if scheduled_for is None:
+        return DueDecision(False, None)
+
+    if scheduled_for <= now < (scheduled_for + timedelta(seconds=window_seconds)):
+        return DueDecision(True, scheduled_for)
+
+    return DueDecision(False, scheduled_for)
+
+
+def _already_logged(db: Session, item_id: int, scheduled_for: datetime) -> bool:
     existing = (
         db.query(ScheduleLog)
         .filter(
-            ScheduleLog.schedule_item_id == item_id,
-            ScheduleLog.scheduled_for == scheduled_for,
+            and_(
+                ScheduleLog.item_id == item_id,
+                ScheduleLog.scheduled_for == scheduled_for,
+            )
         )
         .first()
     )
-    if existing:
-        return False
+    return existing is not None
 
+
+def _log_run(
+    db: Session,
+    item_id: int,
+    scheduled_for: datetime,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
     log = ScheduleLog(
-        schedule_item_id=item_id,
+        item_id=item_id,
         scheduled_for=scheduled_for,
-        ran_at=now_kst_naive(),  # "실제로 시작한 시각" (KST naive)
-        status="STARTED",
-        error=None,
+        status=status,
+        error=error,
+        created_at=_now_local(),
     )
     db.add(log)
     db.commit()
-    return True
 
 
-def mark_log_success(db: Session, item_id: int, scheduled_for: datetime) -> None:
-    log = (
-        db.query(ScheduleLog)
-        .filter(
-            ScheduleLog.schedule_item_id == item_id,
-            ScheduleLog.scheduled_for == scheduled_for,
-        )
-        .order_by(ScheduleLog.id.desc())
-        .first()
-    )
-    if not log:
-        return
+async def _run_item_tts(item: ScheduleItem) -> None:
+    title = (getattr(item, "title", None) or "").strip()
+    body = (getattr(item, "message", None) or "").strip()
 
-    log.status = "SUCCESS"
-    db.commit()
+    if title and body:
+        msg = f"{title}. {body}"
+    elif body:
+        msg = body
+    elif title:
+        msg = title
+    else:
+        msg = "알림입니다."
 
-
-def mark_log_failed(db: Session, item_id: int, scheduled_for: datetime, err: str) -> None:
-    log = (
-        db.query(ScheduleLog)
-        .filter(
-            ScheduleLog.schedule_item_id == item_id,
-            ScheduleLog.scheduled_for == scheduled_for,
-        )
-        .order_by(ScheduleLog.id.desc())
-        .first()
-    )
-    if not log:
-        # STARTED 로그가 없으면 최소한 실패 로그라도 남김
-        log = ScheduleLog(
-            schedule_item_id=item_id,
-            scheduled_for=scheduled_for,
-            ran_at=now_kst_naive(),
-            status="FAILED",
-            error=err,
-        )
-        db.add(log)
-        db.commit()
-        return
-
-    log.status = "FAILED"
-    log.error = err
-    db.commit()
+    await enqueue_tts(msg)
 
 
-# -------------------------
-# Due check / runner
-# -------------------------
-def is_due_this_minute(item: ScheduleItem, scheduled_for: datetime) -> bool:
-    """
-    TODO: 프로젝트 규칙에 맞게 구현해야 하는 핵심 판별 함수.
+async def scheduler_loop() -> None:
+    try:
+        print("[scheduler] loop started")
+        while True:
+            now = _now_local()
+            # tick 로그는 너무 많으면 주석 처리 가능
+            # print("[scheduler] tick", now.strftime("%H:%M:%S"))
 
-    예) item.time_of_day == "22:55" 형태라면:
-      scheduled_for.strftime("%H:%M") == item.time_of_day 인지 비교
-
-    현재는 안전을 위해 "time_of_day"가 있으면 그거만 맞을 때 실행하도록 예시 구현.
-    (원하는 스펙에 맞게 바꿔줘)
-    """
-    if getattr(item, "time_of_day", None):
-        return scheduled_for.strftime("%H:%M") == item.time_of_day
-    return True
-
-
-def run_one_item(db: Session, item: ScheduleItem, scheduled_for: datetime) -> None:
-    """
-    실제 작업 실행 부분.
-    예: 알림 생성/전화/문자 큐잉/오케스트레이터 트리거 등
-
-    MVP에서는 일단 로그만 남기고 끝내도 됨.
-    """
-    # 예시로 콘솔 출력
-    print(
-        "[scheduler] RUN",
-        f"item_id={item.id}",
-        f"title={getattr(item, 'title', None)}",
-        f"scheduled_for={scheduled_for.isoformat()}",
-    )
-    # 실패 테스트:
-    # raise RuntimeError("test failure")
-
-
-# -------------------------
-# Main loop
-# -------------------------
-async def scheduler_loop(poll_seconds: float = 1.0) -> None:
-    """
-    - 매 초 tick
-    - "이번 분"(KST naive, 분 단위 절삭)을 기준으로 due items 실행
-    - 중복 실행 방지: scheduled_for 기준으로 STARTED 로그 선점
-    """
-    print("[scheduler] started", "server_now_kst_naive=", now_kst_naive().isoformat())
-
-    while True:
-        try:
-            tick = now_kst_naive()
-            scheduled_for = truncate_to_minute(tick)
-
-            db = SessionLocal()
+            db: Session = SessionLocal()
             try:
-                due_items = (
-                    db.query(ScheduleItem)
-                    .filter(ScheduleItem.enabled == True)  # noqa: E712
-                    .all()
-                )
+                items: List[ScheduleItem] = db.query(ScheduleItem).all()
 
-                for item in due_items:
-                    if not is_due_this_minute(item, scheduled_for):
+                for item in items:
+                    # ORM 객체 자체를 print하지 말 것(재귀/대량 출력 가능)
+                    decision = _is_due_now(item, now, window_seconds=DUE_WINDOW_SECONDS)
+                    if not decision.is_due or decision.scheduled_for is None:
                         continue
 
-                    locked = acquire_minute_lock(db, item.id, scheduled_for)
-                    if not locked:
+                    if _already_logged(db, item.id, decision.scheduled_for):
                         continue
 
                     try:
-                        run_one_item(db, item, scheduled_for)
-                        mark_log_success(db, item.id, scheduled_for)
+                        await _run_item_tts(item)
+                        _log_run(db, item.id, decision.scheduled_for, "SUCCESS", None)
+                        print(
+                            "[scheduler] SUCCESS",
+                            f"item_id={item.id}",
+                            f"scheduled_for={decision.scheduled_for.isoformat(sep=' ', timespec='seconds')}",
+                        )
                     except Exception as e:
-                        mark_log_failed(db, item.id, scheduled_for, str(e))
+                        _log_run(db, item.id, decision.scheduled_for, "FAILED", repr(e))
+                        print(
+                            "[scheduler] FAILED",
+                            f"item_id={item.id}",
+                            f"scheduled_for={decision.scheduled_for.isoformat(sep=' ', timespec='seconds')}",
+                            f"error={repr(e)}",
+                        )
 
             finally:
                 db.close()
 
-        except Exception as outer:
-            # scheduler 자체가 죽지 않도록 보호
-            print("[scheduler] outer error:", repr(outer))
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
-        await asyncio.sleep(poll_seconds)
-
-
-# -------------------------
-# Background task controls
-# -------------------------
-_scheduler_task: Optional[asyncio.Task] = None
+    except asyncio.CancelledError:
+        print("[scheduler] task cancelled")
+        raise
+    except Exception as e:
+        print("[scheduler] task crashed:", repr(e))
+        traceback.print_exc()
+        raise
 
 
 def start_scheduler() -> None:
-    """
-    FastAPI startup에서 호출.
-    주의: 반드시 "실행 중인 event loop"가 있어야 함(uvicorn 환경 OK).
-    """
     global _scheduler_task
     if _scheduler_task and not _scheduler_task.done():
         return
 
     loop = asyncio.get_running_loop()
     _scheduler_task = loop.create_task(scheduler_loop())
-    print("[scheduler] task created")
+    print("[scheduler] started")
 
 
-def stop_scheduler() -> None:
-    """
-    FastAPI shutdown에서 호출.
-    """
+async def stop_scheduler() -> None:
     global _scheduler_task
     if _scheduler_task and not _scheduler_task.done():
         _scheduler_task.cancel()
-        print("[scheduler] task cancelled")
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
     _scheduler_task = None
+    print("[scheduler] stopped")
