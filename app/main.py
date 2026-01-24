@@ -5,13 +5,19 @@ import time
 from datetime import datetime
 from typing import Optional, List
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Body
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from .scheduler import (
+    start_scheduler,
+    stop_scheduler,
+    upsert_item_job,
+    remove_item_job,
+    parse_time_of_day,
+)
 from .db import Base, engine, DB_PATH, get_db
-from . import models  # 모델 로드(중요)
-from .scheduler import start_scheduler, stop_scheduler
+from . import models
 from .tts_queue import (
     start_tts_worker,
     enqueue_tts,
@@ -20,7 +26,6 @@ from .tts_queue import (
     last_spoken_at,
     spoken_count,
 )
-
 
 app = FastAPI(title="AI Guardian Eye - Scheduling MVP", version="0.1.0")
 
@@ -46,6 +51,13 @@ class ScheduleItemOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ScheduleItemUpdate(BaseModel):
+    title: Optional[str] = None
+    message: Optional[str] = None
+    time_of_day: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 class ScheduleLogOut(BaseModel):
@@ -75,16 +87,10 @@ def now():
 
 @app.on_event("startup")
 async def on_startup():
-    # 어떤 DB 파일을 쓰는지 확인
     print("DB_PATH =", DB_PATH)
-
-    # 테이블 생성 (models가 import되어 있어야 실제 테이블이 생김)
     Base.metadata.create_all(bind=engine)
 
-    # TTS 큐 워커 시작 (선택: TTS 쓰면 켜기)
     start_tts_worker()
-
-    # 스케줄러 시작 (너 프로젝트에서 쓰는 경우)
     start_scheduler()
 
 
@@ -103,9 +109,11 @@ def create_schedule_item(
     payload: ScheduleItemCreate,
     db: Session = Depends(get_db),
 ):
-    # 간단 검증(원하면 더 엄격히)
-    if not payload.time_of_day or ":" not in payload.time_of_day:
-        raise HTTPException(status_code=400, detail="time_of_day must be like 'HH:MM'")
+    if parse_time_of_day(payload.time_of_day) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="time_of_day must be 'HH:MM' or 'HH:MM:SS'",
+        )
 
     item = models.ScheduleItem(
         user_id=payload.user_id,
@@ -117,6 +125,8 @@ def create_schedule_item(
     db.add(item)
     db.commit()
     db.refresh(item)
+
+    upsert_item_job(item)
     return item
 
 
@@ -131,13 +141,12 @@ def list_schedule_items(db: Session = Depends(get_db)):
 
 @app.get("/schedule-logs", response_model=List[ScheduleLogOut])
 def recent_logs(limit: int = 20, db: Session = Depends(get_db)):
-    rows = (
+    return (
         db.query(models.ScheduleLog)
         .order_by(models.ScheduleLog.id.desc())
         .limit(limit)
         .all()
     )
-    return rows
 
 
 @app.post("/debug/speak")
@@ -148,14 +157,73 @@ async def debug_speak(req: SpeakReq):
     except Exception as e:
         raise HTTPException(status_code=500, detail=repr(e))
 
-@app.get("/debug/tts")
-def debug_tts():
+
+@app.post("/debug/tts")
+async def debug_tts(payload: dict = Body(...)):
+    title = (payload.get("title") or "").strip()
+    message = (payload.get("message") or payload.get("text") or "").strip()
+
+    if title and message:
+        msg = f"{title}. {message}"
+    else:
+        msg = message or title or "알림입니다."
+
+    await enqueue_tts(msg)
+    return {"ok": True, "enqueued_text": msg}
+
+
+@app.get("/debug/tts-status")
+def tts_status():
     return {
         "queue_size": queue_size(),
         "spoken_count": spoken_count,
         "last_spoken_at": last_spoken_at,
         "last_error": last_error,
     }
+
+
+@app.patch("/schedule-items/{item_id}", response_model=ScheduleItemOut)
+def update_schedule_item(
+    item_id: int,
+    payload: ScheduleItemUpdate,
+    db: Session = Depends(get_db),
+):
+    item = db.get(models.ScheduleItem, item_id)
+    if not item:
+        raise HTTPException(404, "not found")
+
+    if payload.title is not None:
+        item.title = payload.title
+    if payload.message is not None:
+        item.message = payload.message
+    if payload.time_of_day is not None:
+        if parse_time_of_day(payload.time_of_day) is None:
+            raise HTTPException(
+                status_code=400,
+                detail="time_of_day must be 'HH:MM' or 'HH:MM:SS'",
+            )
+        item.time_of_day = payload.time_of_day
+    if payload.enabled is not None:
+        item.enabled = payload.enabled
+
+    db.commit()
+    db.refresh(item)
+
+    upsert_item_job(item)
+    return item
+
+
+@app.delete("/schedule-items/{item_id}")
+def delete_schedule_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.get(models.ScheduleItem, item_id)
+    if not item:
+        raise HTTPException(404, "not found")
+
+    remove_item_job(item_id)
+
+    db.delete(item)
+    db.commit()
+    return {"ok": True}
 
 
 print("LOADED FILE:", __file__)

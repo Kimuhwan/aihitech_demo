@@ -1,39 +1,52 @@
 # app/tts.py
 import asyncio
+import threading
+import queue
+import traceback
 import pyttsx3
 
-_tts_queue: asyncio.Queue[str] | None = None
-_tts_task: asyncio.Task | None = None
-_engine = None
+# 상태(디버그용)
+spoken_count = 0
+last_error: str | None = None
+last_spoken_at: float | None = None
 
-def _get_engine():
-    global _engine
-    if _engine is None:
-        _engine = pyttsx3.init("sapi5")
-    return _engine
+# 전용 TTS 스레드로 보낼 큐
+_req_q: "queue.Queue[str]" = queue.Queue()
+_thread_started = False
+_thread_lock = threading.Lock()
 
-def speak_blocking(text: str):
-    e = _get_engine()
-    e.say(text)
-    e.runAndWait()
+def _tts_thread_main():
+    global spoken_count, last_error, last_spoken_at
 
-async def tts_worker():
-    assert _tts_queue is not None
+    engine = pyttsx3.init(driverName="sapi5")
     while True:
-        text = await _tts_queue.get()
+        text = _req_q.get()
         try:
-            await asyncio.to_thread(speak_blocking, text)
+            # 상태 꼬임 방지
+            engine.stop()
+            engine.say(text.strip())
+            engine.runAndWait()
+            engine.stop()
+
+            spoken_count += 1
+            last_spoken_at = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else None
+            last_error = None
+        except Exception:
+            last_error = traceback.format_exc()
+            print("[tts] ERROR:", last_error)
         finally:
-            _tts_queue.task_done()
+            _req_q.task_done()
 
 def start_tts():
-    global _tts_queue, _tts_task
-    if _tts_queue is None:
-        _tts_queue = asyncio.Queue()
-    if _tts_task is None or _tts_task.done():
-        _tts_task = asyncio.create_task(tts_worker())
+    global _thread_started
+    with _thread_lock:
+        if _thread_started:
+            return
+        t = threading.Thread(target=_tts_thread_main, daemon=True)
+        t.start()
+        _thread_started = True
 
 async def enqueue_tts(text: str):
-    if _tts_queue is None:
+    if not _thread_started:
         start_tts()
-    await _tts_queue.put(text)
+    _req_q.put(text)
