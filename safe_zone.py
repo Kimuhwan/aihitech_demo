@@ -17,7 +17,8 @@ PRIVACY_MODE = False        # True로 하면 카메라 화면 대신 검은 화�
 safe_zones = []
 current_zone = []
 drawing = False
-
+pred_nose_y = 0
+Fall_Threshold = 30 # 낙상 감지 속도 임계값
 # --- 함수 정의 ---
 
 def draw_safe_zone(event, x, y, flags, param):
@@ -95,6 +96,11 @@ while cap.isOpened():
         track_ids = results[0].boxes.id.int().cpu().tolist()
         keypoints = results[0].keypoints.xy.cpu().numpy()
         boxes = results[0].boxes.xyxy.cpu().numpy()
+        current_nose_y = keypoints[0][1] # 첫 번째 사람의 코 높이 (낙상 속도 계산용)
+        
+        falling_speed = 0
+        if current_nose_y != 0:
+            falling_speed = current_nose_y - pred_nose_y # 단순 속도 계산
 
         for box, track_id, kps in zip(boxes, track_ids, keypoints):
             # 필수 관절 확인
@@ -128,7 +134,7 @@ while cap.isOpened():
                 elapsed = time.time() - fall_timers[track_id]
                 
                 # 시각화 색상 (경고: 주황 -> 확정: 빨강)
-                if elapsed > CONFIRMATION_TIME:
+                if elapsed > CONFIRMATION_TIME and falling_speed > Fall_Threshold:
                     color = (0, 0, 255) # Red
                     status = "!!! FALL DETECTED !!!"
                     # 알림 전송 (단발성 트리거 로직 추가 가능)
