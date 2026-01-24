@@ -10,7 +10,9 @@ for index in range(5):
         # 잠깐 켰다 끔
         ret, frame = cap.read()
         if ret:
-            print(f"   -> 영상 신호 정상 (해상도: {frame.shape[1]}x{frame.shape[0]})")
+            print(f"✅ [카메라 {index}번] 정상 작동 (해상도: {frame.shape[1]}x{frame.shape[0]})")
+        else:
+            print(f"⚠️ [카메라 {index}번] 연결은 됐으나 화면이 안 나옴")
         cap.release()
     else:
         print(f"❌ 번호 {index}: 연결된 장치 없음")
