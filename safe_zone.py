@@ -54,9 +54,6 @@ model = YOLO(MODEL_PATH)
 # --- [핵심] 카메라 선택 로직 ---
 final_cam_index = 0
 
-# --- [핵심] 카메라 선택 로직 ---
-final_cam_index = 0
-
 if TARGET_CAMERA_INDEX is not None:
     # 1. 사용자가 숫자를 지정했으면 무조건 그 번호 사용
     print(f"🔒 사용자 수동 설정에 따라 {TARGET_CAMERA_INDEX}번 카메라를 사용합니다.")
