@@ -102,7 +102,8 @@ while cap.isOpened():
     # 모델 추론
     results = model.track(frame, persist=True, verbose=False)
 
-    if results[0].boxes.id is not None:
+    for result in results:
+        frame = result.plot()
         track_ids = results[0].boxes.id.int().cpu().tolist()
         keypoints = results[0].keypoints.xy.cpu().numpy()
         boxes = results[0].boxes.xyxy.cpu().numpy()
